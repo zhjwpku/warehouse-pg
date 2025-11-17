@@ -237,6 +237,18 @@ static void FreeSnapshot(Snapshot snapshot);
 static void SnapshotResetXmin(void);
 
 /*
+ * Distributed Snapshot fields to be serialized.
+ */
+typedef struct SerializedDistributedSnapshotData
+{
+	DistributedTransactionId xminAllDistributedSnapshots;
+	DistributedSnapshotId distribSnapshotId;
+	DistributedTransactionId xmin;
+	DistributedTransactionId xmax;
+	int32 count;
+} SerializedDistributedSnapshotData;
+
+/*
  * Snapshot fields to be serialized.
  *
  * Only these fields need to be sent to the cooperating backend; the
@@ -253,6 +265,8 @@ typedef struct SerializedSnapshotData
 	CommandId	curcid;
 	TimestampTz whenTaken;
 	XLogRecPtr	lsn;
+	bool 		haveDistribSnapshot;
+	SerializedDistributedSnapshotData ds;
 } SerializedSnapshotData;
 
 Size
@@ -2297,6 +2311,14 @@ EstimateSnapshotSpace(Snapshot snap)
 		size = add_size(size,
 						mul_size(snap->subxcnt, sizeof(TransactionId)));
 
+	/* Allocate for inProgressXidArray in DistributedSnapshot */
+	if (snap->haveDistribSnapshot)
+	{
+		DistributedSnapshot *ds = &snap->distribSnapshotWithLocalMapping.ds;
+		if (ds->count > 0)
+			size = add_size(size, mul_size(ds->count, sizeof(DistributedTransactionId)));
+	}
+
 	return size;
 }
 
@@ -2322,6 +2344,26 @@ SerializeSnapshot(Snapshot snapshot, char *start_address)
 	serialized_snapshot.curcid = snapshot->curcid;
 	serialized_snapshot.whenTaken = snapshot->whenTaken;
 	serialized_snapshot.lsn = snapshot->lsn;
+	serialized_snapshot.haveDistribSnapshot = snapshot->haveDistribSnapshot;
+
+	/* Copy distributed transaction snapshot if exists */
+	if (snapshot->haveDistribSnapshot)
+	{
+		DistributedSnapshot *ds = &snapshot->distribSnapshotWithLocalMapping.ds;
+		serialized_snapshot.ds.xminAllDistributedSnapshots = ds->xminAllDistributedSnapshots;
+		serialized_snapshot.ds.distribSnapshotId = ds->distribSnapshotId;
+		serialized_snapshot.ds.xmin = ds->xmin;
+		serialized_snapshot.ds.xmax = ds->xmax;
+		serialized_snapshot.ds.count = ds->count;
+	}
+	else
+	{
+		serialized_snapshot.ds.xminAllDistributedSnapshots = InvalidDistributedTransactionId;
+		serialized_snapshot.ds.distribSnapshotId = 0;
+		serialized_snapshot.ds.xmin = InvalidDistributedTransactionId;
+		serialized_snapshot.ds.xmax = InvalidDistributedTransactionId;
+		serialized_snapshot.ds.count = 0;
+	}
 
 	/*
 	 * Ignore the SubXID array if it has overflowed, unless the snapshot was
@@ -2355,6 +2397,18 @@ SerializeSnapshot(Snapshot snapshot, char *start_address)
 		memcpy((TransactionId *) (start_address + subxipoff),
 			   snapshot->subxip, snapshot->subxcnt * sizeof(TransactionId));
 	}
+
+	/* Copy inProgressXidArray in distributed snapshot */
+	if (snapshot->haveDistribSnapshot && serialized_snapshot.ds.count > 0)
+	{
+		char *dxipoff = start_address +
+						sizeof(SerializedSnapshotData) +
+						snapshot->xcnt * sizeof(TransactionId) +
+						serialized_snapshot.subxcnt * sizeof(TransactionId);
+		memcpy(dxipoff,
+			   snapshot->distribSnapshotWithLocalMapping.ds.inProgressXidArray,
+			   serialized_snapshot.ds.count * sizeof(DistributedTransactionId));
+	}
 }
 
 /*
@@ -2381,6 +2435,10 @@ RestoreSnapshot(char *start_address)
 	size = sizeof(SnapshotData)
 		+ serialized_snapshot.xcnt * sizeof(TransactionId)
 		+ serialized_snapshot.subxcnt * sizeof(TransactionId);
+
+	/* If distributed snapshot exists, add space for inProgressXidArray */
+	if (serialized_snapshot.haveDistribSnapshot && serialized_snapshot.ds.count > 0)
+		size += serialized_snapshot.ds.count * sizeof(DistributedTransactionId);
 
 	/* Copy all required fields */
 	snapshot = (Snapshot) MemoryContextAlloc(TopTransactionContext, size);
@@ -2412,6 +2470,42 @@ RestoreSnapshot(char *start_address)
 			serialized_snapshot.xcnt;
 		memcpy(snapshot->subxip, serialized_xids + serialized_snapshot.xcnt,
 			   serialized_snapshot.subxcnt * sizeof(TransactionId));
+	}
+
+	/* Copy distributed snapshot fields if exists */
+	snapshot->haveDistribSnapshot = serialized_snapshot.haveDistribSnapshot;
+	if (snapshot->haveDistribSnapshot)
+	{
+		DistributedSnapshot *ds = &snapshot->distribSnapshotWithLocalMapping.ds;
+		ds->xminAllDistributedSnapshots = serialized_snapshot.ds.xminAllDistributedSnapshots;
+		ds->distribSnapshotId = serialized_snapshot.ds.distribSnapshotId;
+		ds->xmin = serialized_snapshot.ds.xmin;
+		ds->xmax = serialized_snapshot.ds.xmax;
+		ds->count = serialized_snapshot.ds.count;
+
+		if (ds->count > 0)
+		{
+			char *dxipoff = start_address +
+							sizeof(SerializedSnapshotData) +
+							serialized_snapshot.xcnt * sizeof(TransactionId) +
+							serialized_snapshot.subxcnt * sizeof(TransactionId);
+
+			ds->inProgressXidArray = (DistributedTransactionId*)((char *)(snapshot + 1) +
+									 serialized_snapshot.xcnt * sizeof(TransactionId) +
+									 serialized_snapshot.subxcnt * sizeof(TransactionId));
+
+			memcpy(ds->inProgressXidArray, dxipoff,
+				   ds->count * sizeof(DistributedTransactionId));
+		}
+		else
+		{
+			ds->inProgressXidArray = NULL;
+		}
+	}
+	else
+	{
+		memset(&snapshot->distribSnapshotWithLocalMapping, 0,
+			   sizeof(DistributedSnapshotWithLocalMapping));
 	}
 
 	/* Set the copied flag so that the caller will set refcounts correctly. */

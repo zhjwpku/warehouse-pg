@@ -76,6 +76,8 @@
 #define PARALLEL_KEY_REINDEX_STATE			UINT64CONST(0xFFFFFFFFFFFF000B)
 #define PARALLEL_KEY_RELMAPPER_STATE		UINT64CONST(0xFFFFFFFFFFFF000C)
 #define PARALLEL_KEY_UNCOMMITTEDENUMS		UINT64CONST(0xFFFFFFFFFFFF000D)
+/* CDB: for DtxContextInfo */
+#define PARALLEL_KEY_DTX_CONTEXT_INFO		UINT64CONST(0xFFFFFFFFFFFF000E)
 
 /* Fixed-size parallel state. */
 typedef struct FixedParallelState
@@ -208,6 +210,7 @@ InitializeParallelDSM(ParallelContext *pcxt)
 	Size		combocidlen = 0;
 	Size		tsnaplen = 0;
 	Size		asnaplen = 0;
+	Size		dtxlen = 0;
 	Size		tstatelen = 0;
 	Size		reindexlen = 0;
 	Size		relmapperlen = 0;
@@ -270,8 +273,12 @@ InitializeParallelDSM(ParallelContext *pcxt)
 		shm_toc_estimate_chunk(&pcxt->estimator, relmapperlen);
 		uncommittedenumslen = EstimateUncommittedEnumsSpace();
 		shm_toc_estimate_chunk(&pcxt->estimator, uncommittedenumslen);
+		/* CDB: estimate the size of DtxContextInfo */
+		dtxlen = (Size) DtxContextInfo_SerializeSize(&QEDtxContextInfo);
+		shm_toc_estimate_chunk(&pcxt->estimator, sizeof(uint32) + dtxlen);
+
 		/* If you add more chunks here, you probably need to add keys. */
-		shm_toc_estimate_keys(&pcxt->estimator, 10);
+		shm_toc_estimate_keys(&pcxt->estimator, 11);
 
 		/* Estimate space need for error queues. */
 		StaticAssertStmt(BUFFERALIGN(PARALLEL_ERROR_QUEUE_SIZE) ==
@@ -351,6 +358,7 @@ InitializeParallelDSM(ParallelContext *pcxt)
 		char	   *tsnapspace;
 		char	   *asnapspace;
 		char	   *tstatespace;
+		char	   *dtxspace;
 		char	   *reindexspace;
 		char	   *relmapperspace;
 		char	   *error_queue_space;
@@ -368,6 +376,19 @@ InitializeParallelDSM(ParallelContext *pcxt)
 		gucspace = shm_toc_allocate(pcxt->toc, guc_len);
 		SerializeGUCState(guc_len, gucspace);
 		shm_toc_insert(pcxt->toc, PARALLEL_KEY_GUC, gucspace);
+
+		/*
+		 * CDB: Serialize DtxContextInfo
+		 * QEs use DtxContextInfo to keep distributed transaction consistency with QD.
+		 * QD dispatches DtxContextInfo to QEs, including Writer and Reader QE.
+		 * However, parallel workers can't get dispatched information from QD.
+		 * So the leader QE needs to serialize its DtxContextInfo into DSM.
+		 * When parallel workers are created, they get DtxContextInfo from DSM.
+		 */
+		dtxspace = shm_toc_allocate(pcxt->toc, sizeof(uint32) + dtxlen);
+		*((uint32 *) dtxspace) = (uint32) dtxlen;
+		DtxContextInfo_Serialize(dtxspace + sizeof(uint32), &QEDtxContextInfo);
+		shm_toc_insert(pcxt->toc, PARALLEL_KEY_DTX_CONTEXT_INFO, dtxspace);
 
 		/* Serialize combo CID state. */
 		combocidspace = shm_toc_allocate(pcxt->toc, combocidlen);
@@ -1251,6 +1272,7 @@ ParallelWorkerMain(Datum main_arg)
 	char	   *reindexspace;
 	char	   *relmapperspace;
 	char	   *uncommittedenumsspace;
+	char	   *dtxspace;
 	StringInfoData msgbuf;
 	char	   *session_dsm_handle_space;
 	Snapshot	tsnapshot;
@@ -1301,10 +1323,15 @@ ParallelWorkerMain(Datum main_arg)
 	ParallelLeaderBackendId = fps->parallel_leader_backend_id;
 	on_shmem_exit(ParallelWorkerShutdown, (Datum) 0);
 
-	/* Pass gp_session_id and numsegmentsFromQD to parallel background workers */
+	/*
+	 * CDB: set Gp_role, gp_session_id, numsegmentsFromQD for
+	 * parallel background workers.
+	 */
 	Gp_role = GP_ROLE_EXECUTE;
 	gp_session_id = fps->session_id;
 	numsegmentsFromQD = fps->num_segments;
+	MyProc->mppSessionId = gp_session_id;
+	MyProc->mppIsWriter = false;
 
 	/*
 	 * Now we can find and attach to the error queue provided for us.  That's
@@ -1406,9 +1433,7 @@ ParallelWorkerMain(Datum main_arg)
 	RestoreGUCState(gucspace);
 	CommitTransactionCommand();
 
-	/*
-	 * Parallel background workers are forked by writer QE, they behave as reader QEs.
-	 */
+	/* CDB: Parallel workers behave as Reader QEs. */
 	Gp_is_writer = false;
 
 	/* Crank up a transaction state appropriate to a parallel worker. */
@@ -1423,6 +1448,24 @@ ParallelWorkerMain(Datum main_arg)
 	session_dsm_handle_space =
 		shm_toc_lookup(toc, PARALLEL_KEY_SESSION_DSM, false);
 	AttachSession(*(dsm_handle *) session_dsm_handle_space);
+
+	/* CDB: Restore QEDtxContextInfo */
+	dtxspace = shm_toc_lookup(toc, PARALLEL_KEY_DTX_CONTEXT_INFO, false);
+	uint32 dtx_len = *((uint32 *) dtxspace);
+	DtxContextInfo_Deserialize(dtxspace + sizeof(uint32), (int) dtx_len, &QEDtxContextInfo);
+
+	/*
+	 * CDB: Set DistributedTransactionContext for Parallel workers.
+	 * Parallel workers behaves as Reader QEs, their DistributedTransactionContext
+	 * needs to be set since it is referenced when check tuple visibility.
+	 */
+	if (QEDtxContextInfo.haveDistributedSnapshot)
+	{
+		if (IS_QUERY_DISPATCHER())
+			setDistributedTransactionContext(DTX_CONTEXT_QE_ENTRY_DB_SINGLETON);
+		else
+			setDistributedTransactionContext(DTX_CONTEXT_QE_READER);
+	}
 
 	/*
 	 * If the transaction isolation level is REPEATABLE READ or SERIALIZABLE,
