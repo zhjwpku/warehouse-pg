@@ -307,6 +307,17 @@ ExecReScanForeignScan(ForeignScanState *node)
 {
 	PlanState  *outerPlan = outerPlanState(node);
 
+	/*
+	 * If the FDW doesn't provide a ReScan callback, we cannot rescan.
+	 *
+	 * This check catches cases that couldn't be prevented at planning time,
+	 * primarily correlated subqueries (SubPlans). In SubPlans, the foreign
+	 * table scan is planned independently without knowledge that it will need
+	 * to be rescanned for each outer row.
+	 */
+	if (node->fdwroutine->ReScanForeignScan == NULL)
+		elog(ERROR, "foreign-data wrapper does not support ReScan");
+
 	node->fdwroutine->ReScanForeignScan(node);
 
 	/*
