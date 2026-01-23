@@ -4136,7 +4136,7 @@ AdjustReplicatedTableCounts(EState *estate)
 	{
 		resultRelInfo = estate->es_result_relations + i;
 
-		if (!resultRelInfo->ri_RelationDesc->rd_cdbpolicy)
+		if (GpPolicyIsEntry(resultRelInfo->ri_RelationDesc->rd_cdbpolicy))
 			continue;
 
 		if (GpPolicyIsReplicated(resultRelInfo->ri_RelationDesc->rd_cdbpolicy))

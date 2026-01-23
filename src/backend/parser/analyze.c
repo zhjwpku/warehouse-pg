@@ -3077,8 +3077,16 @@ transformCreateTableAsStmt(ParseState *pstate, CreateTableAsStmt *stmt)
 	 * In binary upgrade mode, we need to create materialize view in utility mode. So we
 	 * should enable the setQryDistributionPolicy function in binary upgrade mode.
 	 */
-	if (stmt->into->distributedBy && (Gp_role == GP_ROLE_DISPATCH || IsBinaryUpgrade))
+	DistributedBy *distributedBy = (DistributedBy *)stmt->into->distributedBy;
+	if (distributedBy && (Gp_role == GP_ROLE_DISPATCH || IsBinaryUpgrade))
+	{
+		if (distributedBy->ptype == POLICYTYPE_ENTRY)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("CTAS DISTRIBUTED COORDINATOR ONLY is not supported yet")));
+
 		setQryDistributionPolicy(pstate, stmt->into, (Query *) stmt->query);
+	}
 
 	return result;
 }
@@ -3589,8 +3597,14 @@ setQryDistributionPolicy(ParseState *pstate, IntoClause *into, Query *qry)
 				 errmsg("number of distributed by columns exceeds limit (%d)",
 						MaxPolicyAttributeNumber)));
 
-	if (dist->ptype == POLICYTYPE_REPLICATED)
+	if (dist->ptype == POLICYTYPE_ENTRY)
+	{
+		qry->intoPolicy = createCoordinatorOnlyPolicy();
+	}
+	else if (dist->ptype == POLICYTYPE_REPLICATED)
+	{
 		qry->intoPolicy = createReplicatedGpPolicy(dist->numsegments);
+	}
 	else
 	{
 		List	*policykeys = NIL;

@@ -945,10 +945,10 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 			policy = createRandomPartitionedPolicy(policy->numsegments);
 	}
 
-	if (partitioned && GpPolicyIsReplicated(policy))
+	if (partitioned && (GpPolicyIsReplicated(policy) || (policy && GpPolicyIsEntry(policy))))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("PARTITION BY clause cannot be used with DISTRIBUTED REPLICATED clause")));
+				 errmsg("PARTITION BY clause cannot be used with DISTRIBUTED REPLICATED or COORDINATOR ONLY clause")));
 
 	/*
 	 * Find columns with default values and prepare for insertion of the
@@ -5195,6 +5195,11 @@ ATPrepCmd(List **wqueue, Relation rel, AlterTableCmd *cmd,
 		case AT_SetDistributedBy:	/* SET DISTRIBUTED BY */
 			ATSimplePermissions(rel, ATT_TABLE | ATT_FOREIGN_TABLE);
 
+			if (GpPolicyIsEntry(rel->rd_cdbpolicy))
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot set the policy of a non-distributed table")));
+
 			if (!recursing) /* MPP-5772, MPP-5784 */
 			{
 				DistributedBy *ldistro;
@@ -5208,6 +5213,12 @@ ATPrepCmd(List **wqueue, Relation rel, AlterTableCmd *cmd,
 					ldistro->numsegments = rel->rd_cdbpolicy->numsegments;
 
 					policy = getPolicyForDistributedBy(ldistro, rel->rd_att);
+
+					if (GpPolicyIsEntry(rel->rd_cdbpolicy))
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("cannot set the policy of a non-distributed table")));
+
 					/* can't set the distribution policy of interior table */
 					if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE && rel->rd_rel->relispartition)
 					{
@@ -5267,6 +5278,11 @@ ATPrepCmd(List **wqueue, Relation rel, AlterTableCmd *cmd,
 
 			if (!recursing)
 			{
+				if (GpPolicyIsEntry(rel->rd_cdbpolicy))
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("cannot expand a non-distributed table")));
+
 				if (Gp_role == GP_ROLE_DISPATCH &&
 					rel->rd_cdbpolicy->numsegments == getgpsegmentCount())
 					ereport(ERROR,
@@ -13650,6 +13666,8 @@ ATExecAlterColumnType(List **wqueue,
 		}
 		else
 		{
+			Assert(!GpPolicyIsEntry(rel->rd_cdbpolicy));
+
 			newpolicy = GpPolicyCopy(rel->rd_cdbpolicy);
 			for (i = 0; i < newpolicy->nattrs; i++)
 			{
@@ -15980,8 +15998,7 @@ ATExecAddInherit(Relation child_rel, RangeVar *parent, LOCKMODE lockmode)
 	const char *trigger_name;
 
 	/* 1. Replicated table cannot inherit a parent */
-	if (child_rel->rd_cdbpolicy &&
-		child_rel->rd_cdbpolicy->ptype == POLICYTYPE_REPLICATED)
+	if (GpPolicyIsReplicated(child_rel->rd_cdbpolicy))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("Replicated table cannot inherit a parent")));
@@ -15993,8 +16010,7 @@ ATExecAddInherit(Relation child_rel, RangeVar *parent, LOCKMODE lockmode)
 	parent_rel = table_openrv(parent, ShareUpdateExclusiveLock);
 
 	/* 2. Replicated table cannot be inherited */
-	if (parent_rel->rd_cdbpolicy &&
-		parent_rel->rd_cdbpolicy->ptype == POLICYTYPE_REPLICATED)
+	if (GpPolicyIsReplicated(parent_rel->rd_cdbpolicy))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("Replicated table cannot be inherited")));
@@ -17411,6 +17427,10 @@ ATExecExpandTable(List **wqueue, Relation rel, AlterTableCmd *cmd)
 			(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 			errmsg("permission denied: \"%s\" is a system catalog", RelationGetRelationName(rel))));
 
+	if (GpPolicyIsEntry(policy))
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot expand a non-distributed table")));
+
 	oldContext = MemoryContextSwitchTo(GetMemoryChunkContext(rel));
 	newPolicy = GpPolicyCopy(policy);
 	MemoryContextSwitchTo(oldContext);
@@ -17976,11 +17996,17 @@ ATExecSetDistributedBy(Relation rel, Node *node, AlterTableCmd *cmd)
 	/* we only support partitioned/replicated tables */
 	if (Gp_role == GP_ROLE_DISPATCH)
 	{
-		if (GpPolicyIsEntry(rel->rd_cdbpolicy))
+		if (GpPolicyIsEntry(rel->rd_cdbpolicy) && !ldistro)
+		{
 			ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("%s not supported on non-distributed tables",
-						ldistro ? "SET DISTRIBUTED BY" : "SET WITH")));
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("SET WITH not supported on non-distributed tables")));
+		} else if (GpPolicyIsEntry(rel->rd_cdbpolicy) || (ldistro && ldistro->ptype == POLICYTYPE_ENTRY))
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot SET DISTRIBUTED COORDINATOR ONLY")));
+		}
 
 		if (rel_is_external_table(RelationGetRelid(rel)))
 		{
@@ -18314,7 +18340,7 @@ ATExecSetDistributedBy(Relation rel, Node *node, AlterTableCmd *cmd)
 			save_optimizer_replicated_table_insert = optimizer_replicated_table_insert;
 			optimizer_replicated_table_insert = false;
 
-			if (force_reorg && !rand_pol && !GpPolicyIsReplicated(rel->rd_cdbpolicy))
+			if (force_reorg && !rand_pol && !GpPolicyIsEntry(rel->rd_cdbpolicy) && !GpPolicyIsReplicated(rel->rd_cdbpolicy))
 			{
 				/*
 				 * since we force the reorg, we don't care about the original
@@ -18510,13 +18536,16 @@ make_distributedby_for_rel(Relation rel)
 
 	dist = makeNode(DistributedBy);
 
-	Assert(policy->ptype != POLICYTYPE_ENTRY);
-
 	if (GpPolicyIsReplicated(policy))
 	{
-		/* must be random distribution */
 		dist->ptype = POLICYTYPE_REPLICATED;
 		dist->numsegments = policy->numsegments;
+		dist->keyCols = NIL;
+	}
+	else if (GpPolicyIsEntry(policy))
+	{
+		dist->ptype = POLICYTYPE_ENTRY;
+		dist->numsegments = -1;
 		dist->keyCols = NIL;
 	}
 	else
