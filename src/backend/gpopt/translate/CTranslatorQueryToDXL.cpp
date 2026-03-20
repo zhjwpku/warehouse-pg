@@ -4822,6 +4822,11 @@ CTranslatorQueryToDXL::ConstructCTEProducerList(List *cte_list,
 		CommonTableExpr *cte = (CommonTableExpr *) lfirst(lc);
 		GPOS_ASSERT(IsA(cte->ctequery, Query));
 
+		if (cte->cterefcount == 0 && ((Query *) cte->ctequery)->commandType == CMD_SELECT)
+		{
+			continue;
+		}
+
 		if (cte->cterecursive)
 		{
 			GPOS_RAISE(gpdxl::ExmaDXL, gpdxl::ExmiQuery2DXLUnsupportedFeature,
