@@ -2470,4 +2470,28 @@ CTranslatorUtils::RelContainsForeignPartitions(const IMDRelation *rel,
 	}
 	return false;
 }
+
+Datum
+CTranslatorUtils::CreateDatumFromCDXLDatumGeneric(BOOL passed_by_val, ULONG length,
+												  const CDXLDatumGeneric *datum_generic_dxl)
+{
+	Datum result = 0;
+	if (passed_by_val)
+	{
+		GPOS_ASSERT(length <= sizeof(Datum));
+		// make sure the length passed in equals to the result of datum_generic_dxl->Length()
+		GPOS_ASSERT(length == datum_generic_dxl->Length());
+		memcpy(&result, datum_generic_dxl->GetByteArray(), length);
+	}
+	else
+	{
+		Datum val = gpdb::DatumFromPointer(datum_generic_dxl->GetByteArray());
+		ULONG new_length = (ULONG) gpdb::DatumSize(val, false, length);
+		CHAR *buffer = (CHAR *) gpdb::GPDBAlloc(new_length + 1);
+		memcpy(buffer, datum_generic_dxl->GetByteArray(), new_length);
+		buffer[new_length] = '\0';
+		result = gpdb::DatumFromPointer(buffer);
+	}
+	return result;
+}
 // EOF
